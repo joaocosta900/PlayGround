@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Homem-Areia — Sandman VFX</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#0b0803; font-family:system-ui,sans-serif; }
+  canvas { display:block; }
+  #ui {
+    position:fixed; top:12px; left:12px; z-index:10;
+    background:rgba(30,22,10,.82); border:1px solid rgba(194,161,107,.35);
+    border-radius:10px; padding:14px 16px; color:#e8d9bc; width:250px;
+    backdrop-filter:blur(6px); user-select:none;
+  }
+  #ui h1 { font-size:14px; letter-spacing:1px; color:#C2A16B; margin-bottom:10px; text-transform:uppercase; }
+  #ui label { display:flex; justify-content:space-between; font-size:11px; margin:7px 0 2px; opacity:.85; }
+  #ui input[type=range] { width:100%; accent-color:#C2A16B; height:18px; }
+  #ui button {
+    margin-top:10px; width:100%; padding:8px; border:none; border-radius:6px;
+    background:#C2A16B; color:#241a09; font-weight:700; font-size:12px;
+    cursor:pointer; text-transform:uppercase; letter-spacing:1px;
+  }
+  #ui button:hover { background:#dcc08c; }
+  #hint {
+    position:fixed; bottom:12px; left:50%; transform:translateX(-50%);
+    color:rgba(232,217,188,.5); font-size:11px; z-index:10; text-align:center;
+  }
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>Homem-Areia</h1>
+  <label>Densidade <span id="vDensity">60k</span></label>
+  <input type="range" id="density" min="5" max="120" step="5" value="60">
+  <label>Tamanho do grão <span id="vSize">1.6</span></label>
+  <input type="range" id="size" min="0.5" max="4" step="0.1" value="1.6">
+  <label>Turbulência <span id="vTurb">1.0</span></label>
+  <input type="range" id="turb" min="0" max="3" step="0.05" value="1">
+  <label>Vel. dissolução <span id="vSpeed">1.0</span></label>
+  <input type="range" id="speed" min="0.1" max="4" step="0.1" value="1">
+  <button id="cycle">Desfazer / Reformar</button>
+</div>
+<div id="hint">Arraste para girar • Scroll para zoom • O ciclo de dissolução é automático</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+               "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const BASE = new THREE.Color('#C2A16B');
+const DEVICE = { density: 60, size: 1.6, turb: 1.0, speed: 1.0 };
+let points, geometry, t0 = performance.now(), auto = true, phase = 0, phaseDir = 1;
+
+// ---------- Cena ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#0b0803');
+scene.fog = new THREE.FogExp2(0x0b0803, 0.05);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.1, 200);
+camera.position.set(0, 2.4, 11);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 2.2, 0);
+controls.enableDamping = true;
+controls.minDistance = 4; controls.maxDistance = 40;
+
+// Luz solo para o "chão" apenas
+const hemi = new THREE.HemisphereLight(0xC2A16B, 0x241a09, 0.35);
+scene.add(hemi);
+
+// Chão de areia (disco)
+const ground = new THREE.Mesh(
+  new THREE.CircleGeometry(30, 48),
+  new THREE.MeshStandardMaterial({ color:0x6e5633, roughness:1 })
+);
+ground.rotation.x = -Math.PI/2;
+scene.add(ground);
+
+// ---------- Corpo humanoideo alvo (amostragem de pontos) ----------
+function rand(a,b){ return a + Math.random()*(b-a); }
+
+function sampleBody(n){
+  const arr = new Float32Array(n*3);
+  const parts = [
+    // [cx,cy,cz, raio/raioX, meioY/tamZ, peso, tipo]
+    [ 0, 4.05, 0, 0.42, 0.42, 0.12, 'sphere' ],  // cabeça
+    [ 0, 2.95, 0, 0.62, 0.55, 0.26, 'ellipsoid'],// torso
+    [ 0, 3.62, 0, 0.30, 0.28, 0.10, 'ellipsoid'],// ombros
+    [-0.78, 3.0, 0, 0.17, 0.85, 0.09, 'capsuleZ'],// braço esq
+    [ 0.78, 3.0, 0, 0.17, 0.85, 0.09, 'capsuleZ'],// braço dir
+    [-0.9, 4.0, 0, 0.16, 0.5, 0.05, 'capsuleZ'],  // antebraço+ – simplificado
+    [ 0.9, 4.0, 0, 0.16, 0.5, 0.05, 'capsuleZ'],
+    [-0.28, 1.55, 0, 0.24, 0.95, 0.13, 'ellipsoid'],// perna esq
+    [ 0.28, 1.55, 0, 0.24, 0.95, 0.13, 'ellipsoid'],// perna dir
+  ];
+  const totW = parts.reduce((s,p)=>s+p[6],0);
+  for (let i=0;i<n;i++){
+    let r = Math.random()*totW, p = parts[0];
+    for (const q of parts){ r -= q[6]; if (r<=0){ p=q; break; } }
+    let [cx,cy,cz,rx,ry,w,type] = p;
+    let x,y,z;
+    if (type==='sphere'){
+      const u=Math.random(), v=Math.random();
+      const th=2*Math.PI*u, ph=Math.acos(2*v-1), r0=rx*Math.cbrt(Math.random());
+      x=r0*Math.sin(ph)*Math.cos(th); y=r0*Math.cos(ph); z=r0*Math.sin(ph)*Math.sin(th);
+      cy=4.05; x*= .42; y=y*.42+r0>=0?y:.42*0; y = r0*Math.cos(ph); // recalc
+      x=r0*Math.sin(ph)*Math.cos(th); z=r0*Math.sin(ph)*Math.sin(th);
+      cy=4.05;
+    } else if (type==='ellipsoid'){
+      const u=Math.random(), v=Math.random();
+      const th=2*Math.PI*u, ph=Math.acos(2*v-1), r0=Math.cbrt(Math.random());
+      x=r0*rx*Math.sin(ph)*Math.cos(th); y=r0*ry*Math.cos(ph); z=r0*(rx||0.2)*Math.sin(ph)*Math.sin(th)*0.6;
+    } else { // capsuleZ: cilindro vertical arrendondado
+      const ang=Math.random()*2*Math.PI, r0=rx*Math.sqrt(Math.random());
+      x=Math.cos(ang)*r0; z=Math.sin(ang)*r0*0.8;
+      const u=Math.random()*2-1;
+      y=u*ry;
+      if (Math.random()<0.25){ x*= (0.4+0.6*Math.abs(y/ry)); z*=(0.4+0.6*Math.abs(y/ry)); } // afunila
+    }
+    arr[i*3]=cx+x*1.0; arr[i*3+1]=cy+y*1.0; arr[i*3+2]=cz+z;
+  }
+  return arr;
+}
+
+// Seeded simples para consistência por densidade? Regenerar aleatório tudo bem.
+function buildParticles(count){
+  if (points){ scene.remove(points); geometry.dispose(); points.material.dispose(); }
+
+  const body = sampleBody(count);
+  const scatter = new Float32Array(count*3);
+  const seeds   = new Float32Array(count);
+  const delays  = new Float32Array(count);
+
+  for (let i=0;i<count;i++){
+    // posição dispersa: nuvem/tornado ao redor
+    const ang = rand(0, Math.PI*2), rr = rand(2, 9);
+    scatter[i*3]   = Math.cos(ang)*rr;
+    scatter[i*3+1] = rand(0, 7);
+    scatter[i*3+2] = Math.sin(ang)*rr;
+    seeds[i]  = Math.random()*1000;
+    delays[i] = Math.random();
+  }
+
+  geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(body, 3));      // alvo do corpo
+  geometry.setAttribute('scatter',  new THREE.BufferAttribute(scatter, 3));   // posição dispersa
+  geometry.setAttribute('aSeed',    new THREE.BufferAttribute(seeds, 1));
+  geometry.setAttribute('aDelay',   new THREE.BufferAttribute(delays, 1));
+
+  const material = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: true,
+    blending: THREE.NormalBlending,
+    uniforms: {
+      uTime:    { value: 0 },
+      uSize:    { value: DEVICE.size },
+      uTurb:    { value: DEVICE.turb },
+      uDissolve:{ value: 0 },        // 0 = corpo, 1 = disperso
+      uColor:   { value: BASE },
+      uLight:   { value: new THREE.Vector3(0.5, 0.9, 0.4).normalize() },
+    },
+    vertexShader: /* glsl */`
+      attribute vec3  scatter;
+      attribute float aSeed;
+      attribute float aDelay;
+      uniform float uTime, uSize, uTurb, uDissolve;
+      varying float vShade;
+      varying float vFade;
+
+      // --- value noise 3D ---
+      float hash(vec3 p){ p = fract(p*0.3183099 + vec3(0.1,0.2,0.3)); p *= 17.0;
+        return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+      float noise(vec3 x){
+        vec3 i = floor(x), f = fract(x);
+        f = f*f*(3.0-2.0*f);
+        return mix(mix(mix(hash(i+vec3(0,0,0)), hash(i+vec3(1,0,0)), f.x),
+                       mix(hash(i+vec3(0,1,0)), hash(i+vec3(1,1,0)), f.x), f.y),
+                   mix(mix(hash(i+vec3(0,0,1)), hash(i+vec3(1,0,1)), f.x),
+                       mix(hash(i+vec3(0,1,1)), hash(i+vec3(1,1,1)), f.x), f.y), f.z);
+      }
+      vec3 curl(vec3 p){
+        float e = 0.35;
+        float n1 = noise(p + vec3(0.0, e, 0.0)) - noise(p - vec3(0.0, e, 0.0));
+        float n2 = noise(p + vec3(0.0, 0.0, e)) - noise(p - vec3(0.0, 0.0, e));
+        float n3 = noise(p + vec3( e, 0.0, 0.0)) - noise(p - vec3( e, 0.0, 0.0));
+        return normalize(vec3(n1 - n2, n3 - n1, n2 - n3) + 1e-5);
+      }
+
+      void main(){
+        float t = uTime + aSeed;
+        vec3 bodyP  = position;
+        vec3 scatP  = scatter;
+
+        // poeira ambiente flutuando (quase disperso)
+        float drift = 0.25 * uTurb * sin(t*0.7 + aSeed*7.0) + 0.15*cos(t*0.9 + aSeed*3.0);
+        scatP.y += drift;
+        scatP.x += 0.2*uTurb*sin(t*0.5 + aSeed);
+        scatP.z += 0.2*uTurb*cos(t*0.6 + aSeed*2.0);
+
+        // caminho com curl noise (redemoinho)
+        float d = clamp((uDissolve - aDelay*0.55) / 0.45, 0.0, 1.0);
+        float e = smoothstep(0.0, 1.0, d);
+        vec3 mid = mix(bodyP, scatP, e);
+        vec3 cw = curl(mid*0.55 + vec3(0.0, uTime*0.35, 0.0) + aSeed*0.05);
+        float swirlAmp = uTurb * (0.35 + 1.6*e) * (1.0 - 0.7*e);
+        mid += cw * swirlAmp * sin(e*3.14159) ; // mais turbulência no meio da transformação
+        vFade = 1.0;
+
+        // micro jitter de grão
+        mid.x += 0.02*sin(t*3.0+aSeed);
+        mid.y += 0.02*cos(t*2.7+aSeed);
+
+        // sombreamento fake do corpo: altura + normal aproximada via gradiente do noise
+        vec3 n = normalize(curl(bodyP*2.0 + aSeed*0.1) + vec3(0.0, bodyP.y*0.3, 0.0));
+        float lit = 0.55 + 0.45*clamp(dot(n, normalize(vec3(0.4,0.8,0.5))), 0.0, 1.0);
+        vShade = mix(lit, 0.75 + 0.25*sin(aSeed), e);
+
+        vec4 mv = modelViewMatrix * vec4(mid, 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = uSize * (240.0 / -mv.z) * (0.6 + 0.8*fract(aSeed));
+      }
+    `,
+    fragmentShader: /* glsl */`
+      uniform vec3 uColor;
+      varying float vShade;
+      varying float vFade;
+      void main(){
+        vec2 c = gl_PointCoord - 0.5;
+        if (dot(c,c) > 0.25) discard;
+        vec3 col = uColor * vShade;
+        // pequena variação por grão em direção ao ocre/claro
+        col *= (0.9 + 0.25*vShade);
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `,
+  });
+
+  points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  scene.add(points);
+}
+
+function regenerate(){ buildParticles(DEVICE.density*1000); }
+regenerate();
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+$('density').addEventListener('input', e => { DEVICE.density = +e.target.value; $('vDensity').textContent = DEVICE.density+'k'; regenerate(); });
+$('size').addEventListener('input', e => { DEVICE.size = +e.target.value; $('vSize').textContent = DEVICE.size.toFixed(1); if(points) points.material.uniforms.uSize.value = DEVICE.size; });
+$('turb').addEventListener('input', e => { DEVICE.turb = +e.target.value; $('vTurb').textContent = DEVICE.turb.toFixed(2); if(points) points.material.uniforms.uTurb.value = DEVICE.turb; });
+$('speed').addEventListener('input', e => { DEVICE.speed = +e.target.value; $('vSpeed').textContent = DEVICE.speed.toFixed(1); });
+$('cycle').addEventListener('click', () => { auto = false; });
+
+// ---------- Loop ----------
+let last = performance.now();
+function animate(now){
+  requestAnimationFrame(animate);
+  const dt = Math.min((now-last)/1000, 0.05); last = now;
+  const t = (now - t0)/1000;
+
+  if (auto){
+    phase += phaseDir * dt * 0.12 * DEVICE.speed;
+    if (phase >= 1){ phase = 1; phaseDir = -1; }
+    if (phase <= 0){ phase = 0; phaseDir = 1; }
+  } else {
+    phase += (1-phase)*dt*1.2*DEVICE.speed*(phaseDir>0?1:0) - phase*dt*1.2*DEVICE.speed*(phaseDir<0?1:0);
+  }
+
+  if (points){
+    points.material.uniforms.uTime.value = t;
+    points.material.uniforms.uDissolve.value = phase;
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(animate);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
